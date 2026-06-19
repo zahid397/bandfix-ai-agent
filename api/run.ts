@@ -1,87 +1,70 @@
-/**
- * Vercel serverless function — POST /api/run
- *
- * Streams the multi-agent debugging session to the client as Server-Sent
- * Events. The orchestrator starts executing the instant the stream opens, so
- * the client never sees a stuck QUEUED state.
- *
- * Frontend consumer: src/routes/_shell.run.$id.tsx
- * Runtime: Node.js (uses node:events). Max duration 60s — see vercel.json.
- */
-
+// api/run.ts
 import { runDebugSession } from "./_lib/runner";
-import type { SessionInput, StreamEvent } from "../src/lib/bandfix-types";
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 export const config = {
-  runtime: "nodejs",
-  maxDuration: 60,
+  maxDuration: 60, // Vercel Hobby tier max 60s
 };
 
-export default async function handler(request: Request): Promise<Response> {
-  if (request.method !== "POST") {
-    return new Response("Method Not Allowed", { status: 405 });
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // 1. Method Check
+  if (req.method !== "POST") {
+    return res.status(405).send("Method Not Allowed");
   }
 
-  let input: SessionInput;
-  try {
-    input = (await request.json()) as SessionInput;
-  } catch {
-    return new Response("Invalid JSON body", { status: 400 });
-  }
+  // Vercel automatically parses JSON bodies into req.body
+  const input = req.body;
 
   if (!input?.code || typeof input.code !== "string") {
-    return new Response("`code` is required", { status: 400 });
+    return res.status(400).send("`code` is required");
   }
 
-  const encoder = new TextEncoder();
+  // 2. Setup Server-Sent Events (SSE) Headers for Node.js
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let closed = false;
-      const safeEnqueue = (chunk: string) => {
-        if (closed) return;
-        try {
-          controller.enqueue(encoder.encode(chunk));
-        } catch {
-          /* controller already closed */
-        }
-      };
-      const send = (event: StreamEvent) => safeEnqueue(`data: ${JSON.stringify(event)}\n\n`);
+  let closed = false;
 
-      // Open the stream immediately + keep the connection warm during the
-      // (potentially long) model calls so no proxy buffers or times us out.
-      safeEnqueue(":ok\n\n");
-      const heartbeat = setInterval(() => safeEnqueue(":hb\n\n"), 15000);
+  // Helper to send data chunks
+  const send = (event: any) => {
+    if (closed) return;
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+    // Force flush if available (helps in some serverless environments)
+    if (typeof (res as any).flush === 'function') {
+      (res as any).flush();
+    }
+  };
 
-      try {
-        for await (const ev of runDebugSession({
-          title: input.title || "Untitled bug",
-          language: input.language || "javascript",
-          code: input.code,
-          error: input.error || "",
-        })) {
-          send(ev);
-        }
-      } catch (err) {
-        send({ kind: "error", error: err instanceof Error ? err.message : "Unknown error" });
-      } finally {
-        clearInterval(heartbeat);
-        closed = true;
-        try {
-          controller.close();
-        } catch {
-          /* already closed */
-        }
-      }
-    },
+  // 3. Keep-alive Heartbeat
+  res.write(":ok\n\n");
+  const heartbeat = setInterval(() => {
+    if (!closed) res.write(":hb\n\n");
+  }, 15000);
+
+  // Handle client disconnect gracefully
+  req.on('close', () => {
+    closed = true;
+    clearInterval(heartbeat);
   });
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "X-Accel-Buffering": "no",
-    },
-  });
+  // 4. Run the Agent Pipeline
+  try {
+    for await (const ev of runDebugSession({
+      title: input.title || "Untitled bug",
+      language: input.language || "javascript",
+      code: input.code,
+      error: input.error || "",
+    })) {
+      if (closed) break;
+      send(ev);
+    }
+  } catch (err) {
+    send({ kind: "error", error: err instanceof Error ? err.message : "Unknown error" });
+  } finally {
+    clearInterval(heartbeat);
+    closed = true;
+    res.end(); // Close the Node.js response stream
+  }
 }
