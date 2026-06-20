@@ -4,81 +4,40 @@ export const config = {
   maxDuration: 60,
 };
 
-type RunInput = {
-  title?: string;
-  language?: string;
-  code: string;
-  error?: string;
-};
-
-type StreamEvent = {
-  kind: string;
-  message?: string;
-  agent?: string;
-  status?: "queued" | "running" | "completed" | "failed";
-  content?: string;
-  error?: string;
-  data?: unknown;
-};
-
-function parseBody(body: unknown): Partial<RunInput> {
-  if (!body) return {};
-
-  if (typeof body === "string") {
-    try {
-      return JSON.parse(body) as Partial<RunInput>;
-    } catch {
-      return {};
-    }
-  }
-
-  if (typeof body === "object") {
-    return body as Partial<RunInput>;
-  }
-
-  return {};
+function sendSse(res: VercelResponse, event: unknown) {
+  res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function sendJson(res: VercelResponse, status: number, data: unknown) {
-  return res.status(status).json(data);
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     if (req.method === "OPTIONS") {
       res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       return res.status(204).end();
     }
 
+    // GET health check, so GET /api/run never becomes 500
+    if (req.method === "GET") {
+      return res.status(200).json({
+        ok: true,
+        route: "/api/run",
+        message: "BandFix API is alive",
+        hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY),
+        time: new Date().toISOString(),
+      });
+    }
+
     if (req.method !== "POST") {
-      return sendJson(res, 405, {
-        success: false,
+      return res.status(405).json({
+        ok: false,
         error: "Method Not Allowed",
-        allowedMethods: ["POST"],
       });
     }
-
-    const input = parseBody(req.body);
-
-    if (!input.code || typeof input.code !== "string") {
-      return sendJson(res, 400, {
-        success: false,
-        error: "`code` is required and must be a string",
-      });
-    }
-
-    const openaiKey = process.env.OPENAI_API_KEY;
-
-    if (!openaiKey) {
-      return sendJson(res, 500, {
-        success: false,
-        error: "OPENAI_API_KEY is missing in Vercel Environment Variables",
-      });
-    }
-
-    const { runDebugSession } = await import("./_lib/runner");
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -86,94 +45,127 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.setHeader("X-Accel-Buffering", "no");
     res.setHeader("Access-Control-Allow-Origin", "*");
 
-    let closed = false;
-
-    const send = (event: StreamEvent) => {
-      if (closed || res.writableEnded) return;
-
-      try {
-        res.write(`data: ${JSON.stringify(event)}\n\n`);
-      } catch (error) {
-        closed = true;
-        console.error("[api/run] Stream write failed:", error);
-      }
-    };
-
-    const heartbeat = setInterval(() => {
-      if (!closed && !res.writableEnded) {
-        try {
-          res.write(":hb\n\n");
-        } catch {
-          closed = true;
-          clearInterval(heartbeat);
-        }
-      }
-    }, 15000);
-
-    req.on("close", () => {
-      closed = true;
-      clearInterval(heartbeat);
+    sendSse(res, {
+      kind: "session",
+      sessionId: "test-session",
+      startedAt: Date.now(),
     });
 
-    res.write(":ok\n\n");
+    await sleep(800);
 
-    send({
-      kind: "status",
-      message: "Debug session started",
-      status: "running",
+    sendSse(res, {
+      kind: "agent-status",
+      agent: "orchestrator",
+      status: "complete",
     });
 
-    try {
-      for await (const event of runDebugSession({
-        title: input.title || "Untitled bug",
-        language: input.language || "javascript",
-        code: input.code,
-        error: input.error || "",
-      })) {
-        if (closed || res.writableEnded) break;
-        send(event);
-      }
+    await sleep(800);
 
-      send({
-        kind: "done",
-        message: "Debug session completed",
-        status: "completed",
-      });
-    } catch (error) {
-      console.error("[api/run] Runner failed:", error);
+    sendSse(res, {
+      kind: "agent-status",
+      agent: "bug-finder",
+      status: "thinking",
+    });
 
-      send({
-        kind: "error",
-        status: "failed",
-        error: error instanceof Error ? error.message : "Unknown runner error",
-      });
-    } finally {
-      closed = true;
-      clearInterval(heartbeat);
+    await sleep(800);
 
-      if (!res.writableEnded) {
-        res.end();
-      }
-    }
+    sendSse(res, {
+      kind: "message",
+      message: {
+        id: "msg-1",
+        timestamp: Date.now(),
+        sessionId: "test-session",
+        channel: "#bug-report",
+        from: "bug-finder",
+        to: "all",
+        type: "data",
+        text: "Test root cause found successfully.",
+        data: {
+          rootCause: "Test success",
+          explanation: "The SSE stream is working on Vercel.",
+          severity: "medium",
+        },
+      },
+    });
+
+    await sleep(800);
+
+    sendSse(res, {
+      kind: "agent-status",
+      agent: "bug-finder",
+      status: "complete",
+    });
+
+    await sleep(800);
+
+    sendSse(res, {
+      kind: "agent-status",
+      agent: "fix-generator",
+      status: "working",
+    });
+
+    await sleep(800);
+
+    sendSse(res, {
+      kind: "agent-status",
+      agent: "fix-generator",
+      status: "complete",
+    });
+
+    await sleep(800);
+
+    sendSse(res, {
+      kind: "agent-status",
+      agent: "reviewer",
+      status: "complete",
+    });
+
+    sendSse(res, {
+      kind: "done",
+      session: {
+        id: "test-session",
+        createdAt: Date.now(),
+        durationMs: 5000,
+        input: {},
+        bugReport: {
+          rootCause: "Test success",
+          explanation: "Vercel SSE stream works.",
+          severity: "medium",
+        },
+        fix: {
+          fixedCode: "// test fixed code",
+          changes: ["Verified SSE stream"],
+        },
+        review: {
+          status: "approved",
+          securityNote: "No issue",
+          performanceNote: "No issue",
+          recommendation: "SSE route is working",
+          score: 100,
+        },
+        messages: [],
+        status: "complete",
+      },
+    });
+
+    return res.end();
   } catch (error) {
-    console.error("[api/run] Fatal error:", error);
+    console.error("[api/run] test route failed:", error);
 
     if (!res.headersSent) {
-      return sendJson(res, 500, {
-        success: false,
-        error: error instanceof Error ? error.message : "Internal Server Error",
+      return res.status(500).json({
+        ok: false,
+        error: error instanceof Error ? error.message : "Unknown error",
       });
     }
 
-    if (!res.writableEnded) {
-      res.write(
-        `data: ${JSON.stringify({
-          kind: "error",
-          status: "failed",
-          error: error instanceof Error ? error.message : "Internal Server Error",
-        })}\n\n`,
-      );
-      res.end();
-    }
+    res.write(
+      `data: ${JSON.stringify({
+        kind: "error",
+        error: error instanceof Error ? error.message : "Unknown error",
+      })}\n\n`,
+    );
+
+    return res.end();
   }
 }
