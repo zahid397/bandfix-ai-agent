@@ -1,23 +1,12 @@
 /**
- * Server-side multi-agent orchestrator for BandFix AI.
+ * Vercel-safe server-side multi-agent orchestrator for BandFix AI.
  *
- * Four agents communicate over an in-memory Band bus (EventEmitter) and the
- * orchestrator streams every transition + message back to the client as SSE.
- *
- * Execution model: a single non-blocking async generator. There is NO queue
- * and nothing polls — each agent runs, publishes to the Band, and we drain
- * the bus into the stream immediately after every step. The pipeline can
- * never sit in a QUEUED state: the moment the stream opens, the orchestrator
- * publishes #new-session and dispatches Bug Finder synchronously.
- *
- * Resilience: if OPENAI_API_KEY is missing or any model call fails, each
- * agent transparently falls back to a deterministic rule-based engine so the
- * pipeline always runs to completion and the UI always progresses.
- *
- * Imported only by api/run.ts (Vercel function) and the Vite dev middleware.
+ * Uses only OPENAI_API_KEY.
+ * Does not require Lovable API.
+ * Does not require the openai npm package.
+ * If OPENAI_API_KEY is missing or OpenAI call fails, it falls back to a deterministic
+ * local rule-based engine so /api/run does not crash.
  */
-
-import { EventEmitter } from "node:events";
 
 import type {
   AgentId,
@@ -33,89 +22,164 @@ import type {
 } from "../../src/lib/bandfix-types";
 
 // ---------------------------------------------------------------------------
-// Band channel — a tiny EventEmitter-backed message bus
+// Lightweight in-memory Band bus
 // ---------------------------------------------------------------------------
 
+type BandHandler = (message: BandMessage) => void;
+
 class BandChannelBus {
-  private emitter = new EventEmitter();
+  private handlers: BandHandler[] = [];
   messages: BandMessage[] = [];
 
   publish(msg: Omit<BandMessage, "id" | "timestamp">): BandMessage {
-    const full: BandMessage = { ...msg, id: cryptoRandomId(), timestamp: Date.now() };
+    const full: BandMessage = {
+      ...msg,
+      id: cryptoRandomId(),
+      timestamp: Date.now(),
+    };
+
     this.messages.push(full);
-    // DEBUG: every event that crosses the bus is logged.
-    console.log(`[bandbus] ${full.channel} | ${full.from} -> ${full.to ?? "all"} | ${full.type} | ${full.text}`);
-    this.emitter.emit("message", full);
+
+    console.log(
+      `[bandbus] ${full.channel} | ${full.from} -> ${full.to ?? "all"} | ${full.type} | ${full.text}`,
+    );
+
+    for (const handler of this.handlers) {
+      try {
+        handler(full);
+      } catch (error) {
+        console.warn("[bandbus] handler failed:", error);
+      }
+    }
+
     return full;
   }
 
-  on(handler: (m: BandMessage) => void): () => void {
-    this.emitter.on("message", handler);
-    return () => this.emitter.off("message", handler);
+  on(handler: BandHandler): () => void {
+    this.handlers.push(handler);
+
+    return () => {
+      this.handlers = this.handlers.filter((h) => h !== handler);
+    };
   }
 }
 
 function cryptoRandomId(): string {
-  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+  return `${Math.random().toString(36).slice(2, 10)}${Date.now()
+    .toString(36)
+    .slice(-4)}`;
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI — JSON-mode helper via function calling (strict schema).
-// Returns null (never throws) when no key is set or the call fails, so the
-// caller can fall back gracefully.
+// OpenAI native fetch helper
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_TIMEOUT_MS = 25000;
 
 function aiEnabled(): boolean {
-  return Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
+  return Boolean(process.env.OPENAI_API_KEY?.trim());
+}
+
+type JsonSchema = Record<string, unknown>;
+
+type OpenAIJsonResponse = {
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+    };
+  }>;
+  error?: {
+    message?: string;
+  };
+};
+
+function extractJson(text: string): string {
+  const trimmed = text.trim();
+
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+
+  const match = trimmed.match(/\{[\s\S]*\}/);
+  return match ? match[0] : trimmed;
 }
 
 async function callAIJsonOrNull<T>(args: {
   system: string;
   user: string;
   schemaName: string;
-  schema: Record<string, unknown>;
+  schema: JsonSchema;
 }): Promise<T | null> {
-  if (!aiEnabled()) return null;
-  try {
-    // Lazy import so the bundle/cold-start stays light and a missing package
-    // never crashes the fallback path.
-    const { default: OpenAI } = await import("openai");
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
 
-    const res = await client.chat.completions.create({
-      model: DEFAULT_MODEL,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: args.system },
-        { role: "user", content: args.user },
-      ],
-      tools: [
-        {
-          type: "function",
-          function: {
-            name: args.schemaName,
-            description: "Return the structured result.",
-            parameters: args.schema as Record<string, unknown>,
+  if (!apiKey) {
+    console.warn(`[ai] ${args.schemaName}: OPENAI_API_KEY missing, using fallback.`);
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: DEFAULT_MODEL,
+        temperature: 0.2,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              `${args.system}\n\n` +
+              `Return ONLY valid JSON. Do not use markdown. Do not add explanation outside JSON. ` +
+              `The JSON object must match this schema name: ${args.schemaName}.`,
           },
-        },
-      ],
-      tool_choice: { type: "function", function: { name: args.schemaName } },
+          {
+            role: "user",
+            content:
+              `${args.user}\n\n` +
+              `Required JSON schema:\n${JSON.stringify(args.schema, null, 2)}`,
+          },
+        ],
+      }),
     });
 
-    const argsStr = res.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments;
-    if (!argsStr) return null;
-    return JSON.parse(argsStr) as T;
-  } catch (err) {
-    console.warn(`[ai] ${args.schemaName} failed, using fallback:`, (err as Error).message);
+    const data = (await response.json()) as OpenAIJsonResponse;
+
+    if (!response.ok) {
+      console.warn(
+        `[ai] ${args.schemaName} failed with status ${response.status}:`,
+        data.error?.message || "Unknown OpenAI error",
+      );
+      return null;
+    }
+
+    const content = data.choices?.[0]?.message?.content;
+
+    if (!content) {
+      console.warn(`[ai] ${args.schemaName} returned empty response, using fallback.`);
+      return null;
+    }
+
+    return JSON.parse(extractJson(content)) as T;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown AI error";
+    console.warn(`[ai] ${args.schemaName} failed, using fallback:`, message);
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic fallback engine (no network). Mirrors the AI output shapes so
-// the pipeline behaves identically whether or not a key is present.
+// Deterministic fallback engine
 // ---------------------------------------------------------------------------
 
 interface Pattern {
@@ -128,7 +192,7 @@ interface Pattern {
 
 const PATTERNS: Pattern[] = [
   {
-    test: /cannot read propert|reading '|null is not an object|nullpointer/i,
+    test: /cannot read propert|reading '|null is not an object|nullpointer|undefined/i,
     rootCause: "Null / undefined reference",
     explanation:
       "The code accesses a property or method on a value that is null or undefined at runtime. A guard is needed before the access.",
@@ -144,9 +208,10 @@ const PATTERNS: Pattern[] = [
     strategy: "declare",
   },
   {
-    test: /unhandled|fetch failed|network|timeout|econnrefused|promise/i,
+    test: /unhandled|fetch failed|network|timeout|econnrefused|promise|500|internal server error/i,
     rootCause: "Unhandled asynchronous / network error",
-    explanation: "An async or network operation can reject, but the failure path is not handled.",
+    explanation:
+      "An async or network operation can reject, but the failure path is not handled correctly.",
     severity: "medium",
     strategy: "try-catch",
   },
@@ -161,18 +226,27 @@ const PATTERNS: Pattern[] = [
 ];
 
 function fallbackAnalyze(input: SessionInput): BugReport {
-  const haystack = `${input.error}\n${input.code}`;
-  const p = PATTERNS.find((pat) => pat.test.test(haystack));
-  if (p) return { rootCause: p.rootCause, explanation: p.explanation, severity: p.severity };
+  const haystack = `${input.error || ""}\n${input.code || ""}`;
+  const pattern = PATTERNS.find((pat) => pat.test.test(haystack));
+
+  if (pattern) {
+    return {
+      rootCause: pattern.rootCause,
+      explanation: pattern.explanation,
+      severity: pattern.severity,
+    };
+  }
+
   return {
     rootCause: "Logic / runtime issue",
-    explanation: "The submitted code does not behave as intended for the given input.",
+    explanation:
+      "The submitted code does not behave as intended for the given input. Review the control flow, inputs, and runtime assumptions.",
     severity: "medium",
   };
 }
 
 function fallbackFix(input: SessionInput, bug: BugReport): FixResult {
-  const code = input.code;
+  const code = input.code || "";
   const changes: string[] = [];
   let fixedCode = code;
 
@@ -181,17 +255,32 @@ function fallbackFix(input: SessionInput, bug: BugReport): FixResult {
   if (strategy === "try-catch") {
     const indented = code
       .split("\n")
-      .map((l) => (l.length ? "  " + l : l))
+      .map((line) => (line.trim().length ? `  ${line}` : line))
       .join("\n");
-    fixedCode = `try {\n${indented}\n} catch (err) {\n  console.error("Operation failed:", err);\n}`;
-    changes.push("Wrapped the failing operation in error handling so rejections are caught and logged.");
+
+    fixedCode =
+      `try {\n` +
+      `${indented}\n` +
+      `} catch (error) {\n` +
+      `  console.error("Operation failed:", error);\n` +
+      `  throw error;\n` +
+      `}\n`;
+
+    changes.push("Wrapped the failing operation in try/catch so runtime failures are handled.");
+  } else if (strategy === "declare") {
+    fixedCode =
+      `// BandFix: Ensure all variables are declared and initialized before use.\n` +
+      `// Check the variable mentioned in the error message and initialize it safely.\n` +
+      code;
+
+    changes.push("Added guidance to initialize undeclared or uninitialized values before use.");
   } else {
-    const guard =
-      `// BandFix: validate inputs before use to prevent "${bug.rootCause}".\n` +
-      `// Add a null / bounds check on the value flagged above before dereferencing it.\n`;
-    fixedCode = guard + code;
-    changes.push(`Added a defensive guard addressing the ${bug.rootCause.toLowerCase()}.`);
-    changes.push("Validate the flagged value before it is read or written.");
+    fixedCode =
+      `// BandFix: Add defensive validation before accessing runtime values.\n` +
+      `// This prevents "${bug.rootCause}" from crashing the application.\n` +
+      code;
+
+    changes.push(`Added defensive guidance for ${bug.rootCause.toLowerCase()}.`);
   }
 
   return { fixedCode, changes };
@@ -199,30 +288,31 @@ function fallbackFix(input: SessionInput, bug: BugReport): FixResult {
 
 function fallbackReview(input: SessionInput, fix: FixResult, bug: BugReport): ReviewResult {
   const changed = fix.fixedCode.trim() !== input.code.trim();
+
   if (!changed) {
     return {
       status: "revision_needed",
-      securityNote: "Could not verify — the code was not modified.",
-      performanceNote: "No change to evaluate.",
-      recommendation: "Apply a guard or input validation, then resubmit.",
+      securityNote: "The code was not modified enough to verify safety.",
+      performanceNote: "No performance impact detected because no concrete fix was applied.",
+      recommendation: "Add validation, error handling, or a guard based on the detected root cause.",
       score: 58,
     };
   }
-  const hardened = /try\s*\{[\s\S]*\}\s*catch/.test(fix.fixedCode) || /BandFix/.test(fix.fixedCode);
+
   return {
     status: "approved",
-    securityNote: hardened ? "Defensive checks added; no obvious vulnerabilities." : "No security-sensitive patterns detected.",
-    performanceNote: "Negligible overhead from the added handling.",
+    securityNote: "Defensive handling was added. No obvious security risk detected in the proposed fix.",
+    performanceNote: "The added validation/error handling has negligible runtime overhead.",
     recommendation:
       bug.severity === "high"
-        ? "Add a regression test for the edge case before deploying."
-        : "Safe to merge; consider a unit test for the fixed path.",
+        ? "Add a regression test for this edge case before deploying."
+        : "Safe to merge after testing the fixed path.",
     score: bug.severity === "high" ? 90 : 86,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Agent implementations — try the model, fall back deterministically.
+// Agent implementations
 // ---------------------------------------------------------------------------
 
 async function runBugFinder(band: BandChannelBus, input: SessionInput): Promise<BugReport> {
@@ -237,16 +327,17 @@ async function runBugFinder(band: BandChannelBus, input: SessionInput): Promise<
   const ai = await callAIJsonOrNull<BugReport>({
     schemaName: "report_bug",
     system:
-      "You are BugFinder, a staff-level engineer who pinpoints root causes precisely. " +
-      "Be concrete, name the failing construct, and avoid generic advice.",
+      "You are BugFinder, a staff-level engineer who pinpoints root causes precisely. Be concrete and avoid generic advice.",
     user:
-      `Title: ${input.title || "Untitled"}\nLanguage: ${input.language}\n` +
-      `Error:\n${input.error || "(none)"}\n\nCode:\n${input.code}`,
+      `Title: ${input.title || "Untitled"}\n` +
+      `Language: ${input.language}\n\n` +
+      `Error:\n${input.error || "(none)"}\n\n` +
+      `Code:\n${input.code}`,
     schema: {
       type: "object",
       properties: {
-        rootCause: { type: "string", description: "One-sentence root cause." },
-        explanation: { type: "string", description: "2-4 sentence explanation referencing specific lines/constructs." },
+        rootCause: { type: "string" },
+        explanation: { type: "string" },
         severity: { type: "string", enum: ["low", "medium", "high"] },
       },
       required: ["rootCause", "explanation", "severity"],
@@ -280,25 +371,26 @@ async function runFixGenerator(
     channel: "#fix-proposal",
     from: "fix-generator",
     type: "status",
-    text: feedback ? "Revising fix with reviewer feedback…" : "Drafting an optimized fix that preserves intent…",
+    text: feedback ? "Revising fix with reviewer feedback…" : "Drafting a fix that preserves intent…",
   });
 
   const ai = await callAIJsonOrNull<FixResult>({
     schemaName: "propose_fix",
     system:
-      "You are FixGenerator, a senior engineer. Return corrected, runnable code that " +
-      "preserves original intent and addresses the root cause. Keep the same language.",
+      "You are FixGenerator, a senior engineer. Return corrected, runnable code that preserves original intent.",
     user:
-      `Language: ${input.language}\n` +
+      `Language: ${input.language}\n\n` +
       `Root cause: ${bugReport.rootCause}\n` +
-      `Explanation: ${bugReport.explanation}\n` +
-      (feedback ? `Reviewer feedback to address:\n${feedback}\n` : "") +
-      `Original error:\n${input.error || "(none)"}\n\nOriginal code:\n${input.code}`,
+      `Explanation: ${bugReport.explanation}\n\n` +
+      (feedback ? `Reviewer feedback:\n${feedback}\n\n` : "") +
+      `Original error:\n${input.error || "(none)"}\n\n` +
+      `Original code:\n${input.code}\n\n` +
+      `Return full corrected code and concrete changes. Do not mention Lovable.`,
     schema: {
       type: "object",
       properties: {
-        fixedCode: { type: "string", description: "The full, corrected source code." },
-        changes: { type: "array", items: { type: "string" }, description: "Bulleted list of concrete changes." },
+        fixedCode: { type: "string" },
+        changes: { type: "array", items: { type: "string" } },
       },
       required: ["fixedCode", "changes"],
       additionalProperties: false,
@@ -337,9 +429,7 @@ async function runReviewer(
   const ai = await callAIJsonOrNull<ReviewResult>({
     schemaName: "review_fix",
     system:
-      "You are Reviewer, a meticulous staff engineer. Audit the proposed fix and " +
-      "return a strict score (0-100) plus concrete notes. Approve only if the fix " +
-      "is correct, safe, and performant.",
+      "You are Reviewer, a meticulous staff engineer. Audit the proposed fix and return strict review JSON.",
     user:
       `Reported root cause: ${bugReport.rootCause}\n\n` +
       `Original code:\n${input.code}\n\n` +
@@ -374,8 +464,18 @@ async function runReviewer(
 }
 
 // ---------------------------------------------------------------------------
-// Orchestrator — drives the squadron over Band channels (no queue, no polling)
+// Orchestrator
 // ---------------------------------------------------------------------------
+
+function toStatus(agent: AgentId, status: AgentStatus): StreamEvent {
+  console.log(`[orchestrator] transition: ${agent} -> ${status}`);
+
+  return {
+    kind: "agent-status",
+    agent,
+    status,
+  };
+}
 
 export async function* runDebugSession(
   input: SessionInput,
@@ -383,24 +483,35 @@ export async function* runDebugSession(
   const sessionId = cryptoRandomId();
   const startedAt = Date.now();
   const band = new BandChannelBus();
-
   const queue: BandMessage[] = [];
-  band.on((m) => {
-    m.sessionId = sessionId;
-    queue.push(m);
+
+  band.on((message) => {
+    message.sessionId = sessionId;
+    queue.push(message);
   });
 
-  // Helper: emit an agent transition + log it.
-  function status(agent: AgentId, s: AgentStatus): StreamEvent {
-    console.log(`[orchestrator] transition: ${agent} -> ${s}`);
-    return { kind: "agent-status", agent, status: s };
-  }
   function* drain(): Generator<StreamEvent, void, unknown> {
-    while (queue.length) yield { kind: "message", message: queue.shift()! };
+    while (queue.length > 0) {
+      const message = queue.shift();
+
+      if (message) {
+        yield {
+          kind: "message",
+          message,
+        };
+      }
+    }
   }
 
-  yield { kind: "session", sessionId, startedAt };
-  console.log(`[orchestrator] session ${sessionId} started: "${input.title}" (ai=${aiEnabled()})`);
+  yield {
+    kind: "session",
+    sessionId,
+    startedAt,
+  };
+
+  console.log(
+    `[orchestrator] session ${sessionId} started: "${input.title}" ai=${aiEnabled()}`,
+  );
 
   band.publish({
     sessionId,
@@ -411,28 +522,34 @@ export async function* runDebugSession(
     text: `New session "${input.title}" — dispatching Bug Finder.`,
   });
 
+  let bugReport: BugReport | null = null;
+  let fix: FixResult | null = null;
+  let review: ReviewResult | null = null;
+
   try {
-    yield status("orchestrator", "complete");
+    yield toStatus("orchestrator", "complete");
     yield* drain();
 
-    yield status("bug-finder", "thinking");
-    yield* drain();
-    const bugReport = await runBugFinder(band, input);
-    yield* drain();
-    yield status("bug-finder", "complete");
-
-    yield status("fix-generator", "working");
-    yield* drain();
-    let fix = await runFixGenerator(band, input, bugReport);
-    yield* drain();
-    yield status("fix-generator", "complete");
-
-    yield status("reviewer", "thinking");
-    yield* drain();
-    let review = await runReviewer(band, input, bugReport, fix);
+    yield toStatus("bug-finder", "thinking");
     yield* drain();
 
-    // One revision pass if the reviewer asks for it.
+    bugReport = await runBugFinder(band, input);
+    yield* drain();
+    yield toStatus("bug-finder", "complete");
+
+    yield toStatus("fix-generator", "working");
+    yield* drain();
+
+    fix = await runFixGenerator(band, input, bugReport);
+    yield* drain();
+    yield toStatus("fix-generator", "complete");
+
+    yield toStatus("reviewer", "thinking");
+    yield* drain();
+
+    review = await runReviewer(band, input, bugReport, fix);
+    yield* drain();
+
     if (review.status === "revision_needed") {
       band.publish({
         sessionId,
@@ -442,20 +559,24 @@ export async function* runDebugSession(
         type: "status",
         text: "Reviewer requested revisions — re-running Fix Generator.",
       });
+
       yield* drain();
 
-      yield status("fix-generator", "working");
+      yield toStatus("fix-generator", "working");
       yield* drain();
+
       fix = await runFixGenerator(band, input, bugReport, review.recommendation);
       yield* drain();
-      yield status("fix-generator", "complete");
+      yield toStatus("fix-generator", "complete");
 
-      yield status("reviewer", "thinking");
+      yield toStatus("reviewer", "thinking");
       yield* drain();
+
       review = await runReviewer(band, input, bugReport, fix);
       yield* drain();
     }
-    yield status("reviewer", "complete");
+
+    yield toStatus("reviewer", "complete");
 
     band.publish({
       sessionId,
@@ -465,6 +586,7 @@ export async function* runDebugSession(
       type: "status",
       text: `Session complete — fix ${review.status}, score ${review.score}/100.`,
     });
+
     yield* drain();
 
     const session: DebugSession = {
@@ -478,11 +600,18 @@ export async function* runDebugSession(
       messages: band.messages,
       status: "complete",
     };
+
     console.log(`[orchestrator] session ${sessionId} complete in ${session.durationMs}ms`);
-    yield { kind: "done", session };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Unknown error";
+
+    yield {
+      kind: "done",
+      session,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+
     console.error(`[orchestrator] session ${sessionId} failed:`, message);
+
     band.publish({
       sessionId,
       channel: "#session-complete",
@@ -490,21 +619,31 @@ export async function* runDebugSession(
       type: "error",
       text: `Session failed: ${message}`,
     });
+
     yield* drain();
+
     const session: DebugSession = {
       id: sessionId,
       createdAt: startedAt,
       durationMs: Date.now() - startedAt,
       input,
-      bugReport: null,
-      fix: null,
-      review: null,
+      bugReport,
+      fix,
+      review,
       messages: band.messages,
       status: "failed",
       error: message,
     };
-    yield { kind: "error", error: message };
-    yield { kind: "done", session };
+
+    yield {
+      kind: "error",
+      error: message,
+    };
+
+    yield {
+      kind: "done",
+      session,
+    };
   }
 }
 
